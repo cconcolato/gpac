@@ -1054,10 +1054,14 @@ static void av1dmx_bs_log(void *udta, const char *field_name, u32 nb_bits, u64 f
 	GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("\" "));
 }
 
-GF_Err av1dmx_process_buffer(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *data, u32 data_size, Bool is_copy)
+// av1dmx_process_data processes the given data and does not touch the buffer in GF_AV1DmxCtx
+static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *data, u32 data_size, u32 *last_obu_end)
 {
-	u32 last_obu_end = 0;
 	GF_Err e = GF_OK;
+	if (!last_obu_end) {
+		return GF_BAD_PARAM;
+	}
+	*last_obu_end = 0;
 
 	if (!ctx->bs) ctx->bs = gf_bs_new(data, data_size, GF_BITSTREAM_READ);
 	else gf_bs_reassign_buffer(ctx->bs, data, data_size);
@@ -1068,7 +1072,7 @@ GF_Err av1dmx_process_buffer(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *d
 #endif
 
 	//check ivf vs obu vs annexB
-	e = av1dmx_check_format(filter, ctx, ctx->bs, &last_obu_end);
+	e = av1dmx_check_format(filter, ctx, ctx->bs, last_obu_end);
 	if (e==GF_BUFFER_TOO_SMALL) return GF_OK;
 	else if (e) return e;
 
@@ -1083,7 +1087,7 @@ GF_Err av1dmx_process_buffer(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *d
 		}
 
 		if (e!=GF_EOS)
-			last_obu_end = (u32) gf_bs_get_position(ctx->bs);
+			*last_obu_end = (u32) gf_bs_get_position(ctx->bs);
 
 		if (e) {
 			break;
@@ -1092,14 +1096,28 @@ GF_Err av1dmx_process_buffer(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *d
 			break;
 	}
 
-	if (is_copy && last_obu_end) {
-		assert(ctx->buf_size>=last_obu_end);
-		memmove(ctx->buffer, ctx->buffer+last_obu_end, sizeof(char) * (ctx->buf_size-last_obu_end));
-		ctx->buf_size -= last_obu_end;
-	}
 	if (e==GF_EOS) return GF_OK;
 	if (e==GF_BUFFER_TOO_SMALL) return GF_OK;
 	return e;
+}
+
+static void copy_data_to_buffer(GF_AV1DmxCtx *ctx, char *data, u32 data_size)
+{
+	if (ctx->alloc_size < ctx->buf_size + data_size) {
+		ctx->alloc_size = ctx->buf_size + data_size;
+		ctx->buffer = gf_realloc(ctx->buffer, ctx->alloc_size);
+	}
+	memcpy(ctx->buffer+ctx->buf_size, data, data_size);
+	ctx->buf_size += data_size;
+}
+
+static void remove_data_from_buffer(GF_AV1DmxCtx *ctx, u32 position)
+{
+	if (position) {
+		assert(ctx->buf_size>=position);
+		memmove(ctx->buffer, ctx->buffer+position, sizeof(char) * (ctx->buf_size-position));
+		ctx->buf_size -= position;
+	}
 }
 
 GF_Err av1dmx_process(GF_Filter *filter)
@@ -1109,6 +1127,7 @@ GF_Err av1dmx_process(GF_Filter *filter)
 	GF_FilterPacket *pck;
 	char *data;
 	u32 pck_size;
+	u32 processed_length;
 
 	if (ctx->bsmode == UNSUPPORTED) return GF_EOS;
 
@@ -1125,7 +1144,9 @@ GF_Err av1dmx_process(GF_Filter *filter)
 			//flush
 			while (ctx->buf_size) {
 				u32 buf_size = ctx->buf_size;
-				e = av1dmx_process_buffer(filter, ctx, ctx->buffer, ctx->buf_size, GF_TRUE);
+				e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+				remove_data_from_buffer(ctx, processed_length);
+
 				if (e) break;
 				if (buf_size == ctx->buf_size) {
 					break;
@@ -1160,16 +1181,12 @@ GF_Err av1dmx_process(GF_Filter *filter)
 		gf_filter_pck_get_framing(pck, &start, &end);
 		//middle or end of frame, reaggregation
 		if (!start) {
-			if (ctx->alloc_size < ctx->buf_size + pck_size) {
-				ctx->alloc_size = ctx->buf_size + pck_size;
-				ctx->buffer = gf_realloc(ctx->buffer, ctx->alloc_size);
-			}
-			memcpy(ctx->buffer+ctx->buf_size, data, pck_size);
-			ctx->buf_size += pck_size;
+			copy_data_to_buffer(ctx, data, pck_size);
 
 			//end of frame, process av1
 			if (end) {
-				e = av1dmx_process_buffer(filter, ctx, ctx->buffer, ctx->buf_size, GF_TRUE);
+				e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+				remove_data_from_buffer(ctx, processed_length);
 			}
 			ctx->buf_size=0;
 			gf_filter_pid_drop_packet(ctx->ipid);
@@ -1177,7 +1194,8 @@ GF_Err av1dmx_process(GF_Filter *filter)
 		}
 		//flush of pending frame (might have lost something)
 		if (ctx->buf_size) {
-			e = av1dmx_process_buffer(filter, ctx, ctx->buffer, ctx->buf_size, GF_TRUE);
+			e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+			remove_data_from_buffer(ctx, processed_length);
 			ctx->buf_size = 0;
 			if (e) return e;
 		}
@@ -1194,31 +1212,23 @@ GF_Err av1dmx_process(GF_Filter *filter)
 		ctx->buf_size = 0;
 
 		if (!end) {
-			if (ctx->alloc_size < ctx->buf_size + pck_size) {
-				ctx->alloc_size = ctx->buf_size + pck_size;
-				ctx->buffer = gf_realloc(ctx->buffer, ctx->alloc_size);
-			}
-			memcpy(ctx->buffer+ctx->buf_size, data, pck_size);
-			ctx->buf_size += pck_size;
+			copy_data_to_buffer(ctx, data, pck_size);
 			gf_filter_pid_drop_packet(ctx->ipid);
 			return GF_OK;
 		}
 		assert(start && end);
 		//process
-		e = av1dmx_process_buffer(filter, ctx, data, pck_size, GF_FALSE);
+		e = av1dmx_process_data(filter, ctx, data, pck_size, &processed_length);
+		// no need to remove from buffer as the data has not been added to the buffer
 
 		gf_filter_pid_drop_packet(ctx->ipid);
 		return e;
 	}
 
 	//not from framed stream, copy buffer
-	if (ctx->alloc_size < ctx->buf_size + pck_size) {
-		ctx->alloc_size = ctx->buf_size + pck_size;
-		ctx->buffer = gf_realloc(ctx->buffer, ctx->alloc_size);
-	}
-	memcpy(ctx->buffer+ctx->buf_size, data, pck_size);
-	ctx->buf_size += pck_size;
-	e = av1dmx_process_buffer(filter, ctx, ctx->buffer, ctx->buf_size, GF_TRUE);
+	copy_data_to_buffer(ctx, data, pck_size);
+	e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+	remove_data_from_buffer(ctx, processed_length);
 	gf_filter_pid_drop_packet(ctx->ipid);
 	return e;
 }
