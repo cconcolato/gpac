@@ -81,6 +81,10 @@ typedef struct
 	char *buffer;
 	u32 buf_size, alloc_size;
 
+	Bool use_sc_epb;
+	char *epb_buffer;
+	u32 epb_buf_size, epb_alloc_size;
+
 	//ivf header for now
 	u32 file_hdr_size;
 
@@ -260,7 +264,12 @@ GF_Err av1dmx_check_format(GF_Filter *filter, GF_AV1DmxCtx *ctx, GF_BitStream *b
 	}
 
 
-	if (gf_media_aom_probe_annexb(bs)) {
+	p = gf_filter_pid_get_property(ctx->ipid, GF_PROP_PID_UNFRAMED_AV1TS);
+	if (p && p->value.boolean) {
+		GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("[AV1Dmx] Detected AV1 TS format\n"));
+		ctx->bsmode = OBUs;
+		ctx->use_sc_epb = GF_TRUE;
+	} else if (gf_media_aom_probe_annexb(bs)) {
 		GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("[AV1Dmx] Detected Annex B format\n"));
 		ctx->bsmode = AnnexB;
 	} else {
@@ -305,6 +314,11 @@ static void av1dmx_check_dur(GF_Filter *filter, GF_AV1DmxCtx *ctx)
 	const GF_PropertyValue *p;
 	if (!ctx->opid || ctx->timescale || ctx->file_loaded) return;
 
+	if (ctx->use_sc_epb) {
+		// for now, TS encapsulated OBUs cannot be treated here
+		return;
+	}
+	
 	p = gf_filter_pid_get_property(ctx->ipid, GF_PROP_PID_FILE_CACHED);
 	if (p && p->value.boolean) ctx->file_loaded = GF_TRUE;
 
@@ -1054,6 +1068,44 @@ static void av1dmx_bs_log(void *udta, const char *field_name, u32 nb_bits, u64 f
 	GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("\" "));
 }
 
+static void copy_data_to_epb_buffer(GF_AV1DmxCtx *ctx, const char *data, u32 data_size)
+{
+	if (ctx->epb_alloc_size < ctx->epb_buf_size + data_size) {
+		ctx->epb_alloc_size = ctx->epb_buf_size + data_size;
+		ctx->epb_buffer = gf_realloc(ctx->epb_buffer, ctx->epb_alloc_size);
+	}
+	memcpy(ctx->epb_buffer+ctx->epb_buf_size, data, data_size);
+	ctx->epb_buf_size += data_size;
+}
+
+static void remove_data_from_epb_buffer(GF_AV1DmxCtx *ctx, u32 position)
+{
+	if (position) {
+		assert(ctx->epb_buf_size>=position);
+		memmove(ctx->epb_buffer, ctx->epb_buffer+position, sizeof(char) * (ctx->epb_buf_size-position));
+		ctx->epb_buf_size -= position;
+	}
+}
+
+static void copy_data_to_buffer(GF_AV1DmxCtx *ctx, const char *data, u32 data_size)
+{
+	if (ctx->alloc_size < ctx->buf_size + data_size) {
+		ctx->alloc_size = ctx->buf_size + data_size;
+		ctx->buffer = gf_realloc(ctx->buffer, ctx->alloc_size);
+	}
+	memcpy(ctx->buffer+ctx->buf_size, data, data_size);
+	ctx->buf_size += data_size;
+}
+
+static void remove_data_from_buffer(GF_AV1DmxCtx *ctx, u32 position)
+{
+	if (position) {
+		assert(ctx->buf_size>=position);
+		memmove(ctx->buffer, ctx->buffer+position, sizeof(char) * (ctx->buf_size-position));
+		ctx->buf_size -= position;
+	}
+}
+
 // av1dmx_process_data processes the given data and does not touch the buffer in GF_AV1DmxCtx
 static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *data, u32 data_size, u32 *last_obu_end)
 {
@@ -1063,6 +1115,32 @@ static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const ch
 	}
 	*last_obu_end = 0;
 
+	if (ctx->use_sc_epb) {
+		const u8 START_CODE_SIZE = 3;
+		// Copy input to the EPB buffer and mark all of it as used
+		copy_data_to_epb_buffer(ctx, data, data_size);
+		*last_obu_end = data_size;
+		
+		// Try to find an entire OBU (by start code)
+		u32 sc_size =0;
+		u32 obu_size = 0;
+		s32 sc_pos = gf_media_nalu_next_start_code(ctx->epb_buffer, ctx->epb_buf_size, &sc_size);
+		if (sc_pos == ctx->epb_buf_size) {
+			//no start code, continue gathering data
+			return GF_BUFFER_TOO_SMALL;
+		} else {
+			// found next start code, process OBU
+			obu_size = sc_pos-START_CODE_SIZE;
+			u32 nb_epb = gf_media_nalu_emulation_bytes_remove_count(data+START_CODE_SIZE, sc_pos-START_CODE_SIZE);
+			u8 *no_epb_data = malloc(obu_size-nb_epb);
+			if (nb_epb) {
+				obu_size = gf_media_nalu_remove_emulation_bytes(data+START_CODE_SIZE, no_epb_data, sc_pos);
+			} else {
+				memcpy(no_epb_data, data+START_CODE_SIZE, sc_pos-START_CODE_SIZE);
+			}
+		}
+	}
+	
 	if (!ctx->bs) ctx->bs = gf_bs_new(data, data_size, GF_BITSTREAM_READ);
 	else gf_bs_reassign_buffer(ctx->bs, data, data_size);
 
@@ -1099,25 +1177,6 @@ static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const ch
 	if (e==GF_EOS) return GF_OK;
 	if (e==GF_BUFFER_TOO_SMALL) return GF_OK;
 	return e;
-}
-
-static void copy_data_to_buffer(GF_AV1DmxCtx *ctx, char *data, u32 data_size)
-{
-	if (ctx->alloc_size < ctx->buf_size + data_size) {
-		ctx->alloc_size = ctx->buf_size + data_size;
-		ctx->buffer = gf_realloc(ctx->buffer, ctx->alloc_size);
-	}
-	memcpy(ctx->buffer+ctx->buf_size, data, data_size);
-	ctx->buf_size += data_size;
-}
-
-static void remove_data_from_buffer(GF_AV1DmxCtx *ctx, u32 position)
-{
-	if (position) {
-		assert(ctx->buf_size>=position);
-		memmove(ctx->buffer, ctx->buffer+position, sizeof(char) * (ctx->buf_size-position));
-		ctx->buf_size -= position;
-	}
 }
 
 GF_Err av1dmx_process(GF_Filter *filter)
@@ -1349,6 +1408,7 @@ static const GF_FilterCapability AV1DmxCaps[] =
 	CAP_UINT(GF_CAPS_INPUT,GF_PROP_PID_CODECID, GF_CODECID_VP9),
 	CAP_UINT(GF_CAPS_INPUT,GF_PROP_PID_CODECID, GF_CODECID_VP10),
 	CAP_BOOL(GF_CAPS_INPUT,GF_PROP_PID_UNFRAMED, GF_TRUE),
+	CAP_BOOL(GF_CAPS_INPUT,GF_PROP_PID_UNFRAMED_AV1TS, GF_TRUE),
 };
 
 #define OFFS(_n)	#_n, offsetof(GF_AV1DmxCtx, _n)
