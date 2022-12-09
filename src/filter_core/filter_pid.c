@@ -5118,7 +5118,11 @@ single_retry:
     gf_list_del(possible_linked_resolutions);
 	gf_mx_v(filter->session->filters_mx);
 
-
+	if (pid->num_destinations && !pid->not_connected) {
+		assert(pid->init_task_pending);
+		safe_int_dec(&pid->init_task_pending);
+		return;
+	}
 	filter->num_out_pids_not_connected ++;
 	//remove sparse info
 	if (pid->is_sparse) {
@@ -6021,7 +6025,7 @@ restart:
 	pcki = (GF_FilterPacketInstance *)gf_fq_head(pidinst->packets);
 	//no packets
 	if (!pcki) {
-		if (!pidinst->pid || !pidinst->pid->filter) return NULL;
+		if (!pidinst->pid || !pidinst->pid->filter || !pidinst->filter) return NULL;
 		if (pidinst->pid->filter->disabled) {
 			pidinst->is_end_of_stream = pidinst->pid->has_seen_eos = GF_TRUE;
 		}
@@ -7915,6 +7919,17 @@ const GF_PropertyValue *gf_filter_pid_caps_query(GF_FilterPid *pid, u32 prop_4cc
 		for (i=0; i<a_filter->nb_forced_caps; i++) {
 			if (a_filter->forced_caps[i].code==prop_4cc)
 				return &a_filter->forced_caps[i].val;
+		}
+		//not found, check if dst filter is alread linked to a dest - may happen when loading muxes with different chain length:
+		//-i obu -i mp4a -o file.ts
+		//the link fin->mp4dmx->m2tsmx->file.ts is solved before fin->rfav1->ufobu->m2tsmx->ts
+		a_filter = a_filter->dst_filter;
+		while (a_filter) {
+			for (i=0; i<a_filter->nb_forced_caps; i++) {
+				if (a_filter->forced_caps[i].code==prop_4cc)
+					return &a_filter->forced_caps[i].val;
+			}
+			a_filter = a_filter->dst_filter;
 		}
 	}
 

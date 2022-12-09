@@ -155,7 +155,7 @@ typedef struct
 	u32 nal_store_size, nal_store_alloc;
 
 	//list of param sets found
-	GF_List *sps, *pps, *vps, *sps_ext, *pps_svc, *vvc_aps_pre, *vvc_dci;
+	GF_List *sps, *pps, *vps, *sps_ext, *pps_svc, *vvc_aps_pre, *vvc_dci, *vvc_opi;
 	//set to true if one of the PS has been modified, will potentially trigger a PID reconfigure
 	Bool ps_modified;
 
@@ -166,8 +166,8 @@ typedef struct
 	Bool has_islice;
 	//AU is rap
 	GF_FilterSAPType au_sap;
-	//frame first slice
-	Bool first_slice_in_au;
+	//number of slices in frame
+	u32 nb_slices_in_au;
 	//frame first slice
 	Bool au_sap2_poc_reset;
 	//paff used - NEED FURTHER CHECKING
@@ -363,7 +363,7 @@ GF_Err naludmx_configure_pid(GF_Filter *filter, GF_FilterPid *pid, Bool is_remov
 	}
 	if (ctx->timescale && !ctx->opid) {
 		ctx->opid = gf_filter_pid_new(filter);
-		ctx->first_slice_in_au = GF_TRUE;
+		ctx->nb_slices_in_au = 0;
 	}
 	ctx->full_au_source = GF_FALSE;
 	p = gf_filter_pid_get_property(pid, GF_PROP_PID_UNFRAMED_FULL_AU);
@@ -1374,6 +1374,15 @@ static void naludmx_create_vvc_decoder_config(GF_NALUDmxCtx *ctx, u8 **dsi, u32 
 			naludmx_add_param_nalu(cfg->param_array, sl, GF_VVC_NALU_DEC_PARAM);
 	}
 
+	count = gf_list_count(ctx->vvc_opi);
+	for (i=0; i<count; i++) {
+		GF_NALUFFParam *sl = gf_list_get(ctx->vvc_opi, i);
+		layer_id = sl->data[0] & 0x3F;
+		if (!layer_id) *has_vvc_base = GF_TRUE;
+		if (!ctx->analyze)
+			naludmx_add_param_nalu(cfg->param_array, sl, GF_VVC_NALU_OPI);
+	}
+
 	count = gf_list_count(ctx->vvc_aps_pre);
 	for (i=0; i<count; i++) {
 		GF_NALUFFParam *sl = gf_list_get(ctx->vvc_aps_pre, i);
@@ -1564,7 +1573,7 @@ static void naludmx_end_access_unit(GF_NALUDmxCtx *ctx)
 	naludmx_finalize_au_flags(ctx);
 
 	ctx->has_islice = GF_FALSE;
-	ctx->first_slice_in_au = GF_TRUE;
+	ctx->nb_slices_in_au = 0;
 	ctx->sei_recovery_frame_count = -1;
 	ctx->au_sap = GF_FILTER_SAP_NONE;
 	ctx->au_sap2_poc_reset = GF_FALSE;
@@ -1784,10 +1793,11 @@ static void naludmx_check_pid(GF_Filter *filter, GF_NALUDmxCtx *ctx, Bool force_
 	}
 
 	if (!ctx->opid) {
+		u32 slice_in_au = ctx->nb_slices_in_au;
 		ctx->opid = gf_filter_pid_new(filter);
 
 		naludmx_check_dur(filter, ctx);
-		ctx->first_slice_in_au = GF_TRUE;
+		ctx->nb_slices_in_au = slice_in_au;
 	}
 
 	if ((ctx->crc_cfg == crc_cfg) && (ctx->crc_cfg_enh == crc_cfg_enh)
@@ -1802,12 +1812,10 @@ static void naludmx_check_pid(GF_Filter *filter, GF_NALUDmxCtx *ctx, Bool force_
 	if (force_au_flush) {
 		naludmx_end_access_unit(ctx);
 	}
-	
 	naludmx_enqueue_or_dispatch(ctx, NULL, GF_TRUE);
 	if (!ctx->analyze && (gf_list_count(ctx->pck_queue)>1))  {
 		GF_LOG(dsi_enh ? GF_LOG_DEBUG : GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] xPS changed but could not flush frames before signaling state change %s\n", ctx->log_name, dsi_enh ? "- likely scalable xPS update" : "!"));
 	}
-
 	//copy properties at init or reconfig
 	gf_filter_pid_copy_properties(ctx->opid, ctx->ipid);
 
@@ -2010,11 +2018,12 @@ static GFINLINE void naludmx_update_time(GF_NALUDmxCtx *ctx)
 	}
 }
 
-static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u32 ps_type, s32 ps_id)
+static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u32 ps_type, s32 ps_id, u32 tid, u32 lid)
 {
 	GF_List *list = NULL, *alt_list = NULL;
 	GF_NALUFFParam *sl;
 	u32 i, count, crc;
+	Bool flush_au = GF_FALSE;
 
 	if (!size) return;
 	crc = gf_crc_32(data, size);
@@ -2024,9 +2033,11 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 		case GF_HEVC_NALU_VID_PARAM:
 			if (!ctx->vps) ctx->vps = gf_list_new();
 			list = ctx->vps;
+			flush_au = GF_TRUE;
 			break;
 		case GF_HEVC_NALU_SEQ_PARAM:
 			list = ctx->sps;
+			flush_au = GF_TRUE;
 			break;
 		case GF_HEVC_NALU_PIC_PARAM:
 			list = ctx->pps;
@@ -2040,9 +2051,11 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 		case GF_VVC_NALU_VID_PARAM:
 			if (!ctx->vps) ctx->vps = gf_list_new();
 			list = ctx->vps;
+			flush_au = GF_TRUE;
 			break;
 		case GF_VVC_NALU_SEQ_PARAM:
 			list = ctx->sps;
+			flush_au = GF_TRUE;
 			break;
 		case GF_VVC_NALU_PIC_PARAM:
 			list = ctx->pps;
@@ -2050,6 +2063,10 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 		case GF_VVC_NALU_DEC_PARAM:
 			if (!ctx->vvc_dci) ctx->vvc_dci = gf_list_new();
 			list = ctx->vvc_dci;
+			break;
+		case GF_VVC_NALU_OPI:
+			if (!ctx->vvc_opi) ctx->vvc_opi = gf_list_new();
+			list = ctx->vvc_opi;
 			break;
 		case GF_VVC_NALU_APS_PREFIX:
 			if (!ctx->vvc_aps_pre) ctx->vvc_aps_pre = gf_list_new();
@@ -2061,8 +2078,9 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 		}
 	} else {
 		switch (ps_type) {
-		case GF_AVC_NALU_SVC_SUBSEQ_PARAM:
 		case GF_AVC_NALU_SEQ_PARAM:
+			flush_au = GF_TRUE;
+		case GF_AVC_NALU_SVC_SUBSEQ_PARAM:
 			list = ctx->sps;
 			break;
 		case GF_AVC_NALU_PIC_PARAM:
@@ -2105,6 +2123,8 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 		}
 	}
 
+	if (lid || tid) flush_au = GF_FALSE;
+
 	if (sl) {
 		//otherwise we keep this new param set
 		sl->data = gf_realloc(sl->data, size);
@@ -2112,6 +2132,10 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 		sl->size = size;
 		sl->crc = crc;
 		ctx->ps_modified = GF_TRUE;
+		//flush AU if we have a slice
+		if (ctx->opid && flush_au && ctx->first_pck_in_au && ctx->nb_slices_in_au) {
+			naludmx_end_access_unit(ctx);
+		}
 		return;
 	}
 	//TODO we might want to purge the list after a while !!
@@ -2129,6 +2153,10 @@ static void naludmx_queue_param_set(GF_NALUDmxCtx *ctx, char *data, u32 size, u3
 	sl->crc = crc;
 
 	ctx->ps_modified = GF_TRUE;
+	//flush AU if we have a slice
+	if (ctx->opid && flush_au && ctx->first_pck_in_au && ctx->nb_slices_in_au) {
+		naludmx_end_access_unit(ctx);
+	}
 	gf_list_add(list, sl);
 }
 
@@ -2387,7 +2415,7 @@ static s32 naludmx_parse_nal_hevc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Video Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_VID_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_VID_PARAM, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 		break;
@@ -2396,7 +2424,7 @@ static s32 naludmx_parse_nal_hevc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Sequence Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_SEQ_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_SEQ_PARAM, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 		break;
@@ -2405,7 +2433,7 @@ static s32 naludmx_parse_nal_hevc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Picture Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_PIC_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_HEVC_NALU_PIC_PARAM, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 		break;
@@ -2563,7 +2591,7 @@ static s32 naludmx_parse_nal_vvc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool 
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Video Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_VID_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_VID_PARAM, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 		break;
@@ -2572,7 +2600,7 @@ static s32 naludmx_parse_nal_vvc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool 
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Sequence Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_SEQ_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_SEQ_PARAM, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 		break;
@@ -2581,13 +2609,18 @@ static s32 naludmx_parse_nal_vvc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool 
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Picture Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_PIC_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_PIC_PARAM, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 		break;
 	case GF_VVC_NALU_DEC_PARAM:
 		ps_idx = 0;
-		naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_DEC_PARAM, ps_idx);
+		naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_DEC_PARAM, ps_idx, temporal_id, layer_id);
+		*skip_nal = GF_TRUE;
+		break;
+	case GF_VVC_NALU_OPI:
+		ps_idx = 0;
+		naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_OPI, ps_idx, temporal_id, layer_id);
 		*skip_nal = GF_TRUE;
 		break;
 	case GF_VVC_NALU_APS_PREFIX:
@@ -2597,7 +2630,7 @@ static s32 naludmx_parse_nal_vvc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool 
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Decoder Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_APS_PREFIX, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_VVC_NALU_APS_PREFIX, ps_idx, temporal_id, layer_id);
 		}
 		*skip_nal = GF_TRUE;
 #else
@@ -2683,10 +2716,6 @@ static s32 naludmx_parse_nal_vvc(GF_NALUDmxCtx *ctx, char *data, u32 size, Bool 
 		*skip_nal = GF_TRUE;
 		break;
 
-	case GF_VVC_NALU_OPI:
-		if (! ctx->is_playing) return 0;
-		break;
-
 	default:
 		if (! ctx->is_playing) return 0;
 		GF_LOG(GF_LOG_WARNING, GF_LOG_MEDIA, ("[%s] NAL Unit type %d not handled - adding\n", ctx->log_name, nal_unit_type));
@@ -2733,7 +2762,7 @@ static s32 naludmx_parse_nal_avc(GF_NALUDmxCtx *ctx, char *data, u32 size, u32 n
 				GF_LOG(ctx->avc_state->sps[0].profile_idc ? GF_LOG_WARNING : GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Sequence Param Set\n", ctx->log_name));
 			}
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_AVC_NALU_SEQ_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_AVC_NALU_SEQ_PARAM, ps_idx, 0, 0);
 		}
 		*skip_nal = GF_TRUE;
 		return 0;
@@ -2743,7 +2772,7 @@ static s32 naludmx_parse_nal_avc(GF_NALUDmxCtx *ctx, char *data, u32 size, u32 n
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Picture Param Set\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_AVC_NALU_PIC_PARAM, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_AVC_NALU_PIC_PARAM, ps_idx, 0, 0);
 		}
 		*skip_nal = GF_TRUE;
 		return 0;
@@ -2753,7 +2782,7 @@ static s32 naludmx_parse_nal_avc(GF_NALUDmxCtx *ctx, char *data, u32 size, u32 n
 		if (ps_idx<0) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[%s] Error parsing Sequence Param Set Extension\n", ctx->log_name));
 		} else {
-			naludmx_queue_param_set(ctx, data, size, GF_AVC_NALU_SEQ_PARAM_EXT, ps_idx);
+			naludmx_queue_param_set(ctx, data, size, GF_AVC_NALU_SEQ_PARAM_EXT, ps_idx, 0, 0);
 		}
 		*skip_nal = GF_TRUE;
 		return 0;
@@ -3270,7 +3299,7 @@ naldmx_flush:
 		}
 
 		//new frame - if no slices, we detected the new frame on AU delimiter, don't flush new frame !
-		if ((nal_parse_result>0) && !ctx->first_slice_in_au) {
+		if ((nal_parse_result>0) && ctx->nb_slices_in_au) {
 			naludmx_end_access_unit(ctx);
 		}
 
@@ -3520,7 +3549,7 @@ naldmx_flush:
 		}
 
 		if (is_slice) {
-			Bool first_in_au = ctx->first_slice_in_au;
+			Bool first_in_au = (ctx->nb_slices_in_au==0) ? GF_TRUE : GF_FALSE;
 
 			if (slice_is_idr)
 				ctx->nb_idr++;
@@ -3529,11 +3558,11 @@ naldmx_flush:
 				ctx->nb_cra++;
 
 			slice_force_ref = GF_FALSE;
+			ctx->nb_slices_in_au++;
 
 			/*we only indicate TRUE IDRs for sync samples (cf AVC file format spec).
 			SEI recovery should be used to build sampleToGroup & RollRecovery tables*/
-			if (ctx->first_slice_in_au) {
-				ctx->first_slice_in_au = GF_FALSE;
+			if (first_in_au) {
 				if (recovery_point_valid) {
 					ctx->sei_recovery_frame_count = recovery_point_frame_cnt;
 
@@ -3881,8 +3910,9 @@ static void naludmx_reset_param_sets(GF_NALUDmxCtx *ctx, Bool do_free)
 	naludmx_del_param_list(ctx->pps_svc, do_free);
 	naludmx_del_param_list(ctx->vvc_aps_pre, do_free);
 	naludmx_del_param_list(ctx->vvc_dci, do_free);
-
+	naludmx_del_param_list(ctx->vvc_opi, do_free);
 }
+
 static void naludmx_finalize(GF_Filter *filter)
 {
 	GF_NALUDmxCtx *ctx = gf_filter_get_udta(filter);

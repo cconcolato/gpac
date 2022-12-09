@@ -531,12 +531,13 @@ static void mp4_mux_make_inband_header(GF_MP4MuxCtx *ctx, TrackWriter *tkw, Bool
 			if (!tkw->nal_unit_size) tkw->nal_unit_size = tkw->vvcc->nal_unit_size;
 			mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_APS_PREFIX), tkw->vvcc->nal_unit_size);
 		} else {
-			if (!for_non_rap)
+			if (!for_non_rap) {
+				mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_OPI), tkw->vvcc->nal_unit_size);
+				mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_DEC_PARAM), tkw->vvcc->nal_unit_size);
 				mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_VID_PARAM), tkw->vvcc->nal_unit_size);
-			if (!tkw->nal_unit_size) tkw->nal_unit_size = tkw->vvcc->nal_unit_size;
-
-			if (!for_non_rap)
 				mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_SEQ_PARAM), tkw->vvcc->nal_unit_size);
+			}
+			if (!tkw->nal_unit_size) tkw->nal_unit_size = tkw->vvcc->nal_unit_size;
 
 			mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_PIC_PARAM), tkw->vvcc->nal_unit_size);
 			mp4_mux_write_ps_list(bs, mp4_mux_get_nalus_ps(tkw->vvcc->param_array, GF_VVC_NALU_APS_PREFIX), tkw->vvcc->nal_unit_size);
@@ -2774,14 +2775,23 @@ sample_entry_setup:
 			GF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, ("[MP4Mux] Error creating new DIMS sample description: %s\n", gf_error_to_string(e) ));
 			return e;
 		}
-	} else if (codec_id==GF_CODECID_MPHA) {
+	} else if ((codec_id==GF_CODECID_MPHA) || (codec_id==GF_CODECID_MHAS)) {
 		//not ready yet
-		if (!dsi) return GF_OK;
-
-		e = gf_isom_new_mpha_description(ctx->file, tkw->track_num, NULL, NULL, &tkw->stsd_idx, dsi->value.data.ptr, dsi->value.data.size);
+		u8 *pdsi=NULL;
+		u32 dsi_len=0;
+		if (codec_id==GF_CODECID_MPHA) {
+			if (!dsi) return GF_OK;
+			pdsi = dsi->value.data.ptr;
+			dsi_len = dsi->value.data.size;
+		}
+		e = gf_isom_new_mpha_description(ctx->file, tkw->track_num, NULL, NULL, &tkw->stsd_idx, pdsi, dsi_len, m_subtype);
 		if (e) {
 			GF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, ("[MP4Mux] Error creating new MPEG-H Audio sample description: %s\n", gf_error_to_string(e) ));
 			return e;
+		}
+		p = gf_filter_pid_get_property(pid, GF_PROP_PID_MHA_COMPATIBLE_PROFILES);
+		if (p) {
+			gf_isom_set_mpegh_compatible_profiles(ctx->file, tkw->track_num, tkw->stsd_idx, p->value.uint_list.vals, p->value.uint_list.nb_items);
 		}
 	} else if (codec_id==GF_CODECID_TRUEHD) {
 		u32 fmt=0, prate=0;
@@ -2886,13 +2896,6 @@ sample_entry_setup:
 
 	} else {
 		assert(0);
-	}
-
-	if ((codec_id==GF_CODECID_MPHA) || (codec_id==GF_CODECID_MHAS)) {
-		p = gf_filter_pid_get_property(pid, GF_PROP_PID_MHA_COMPATIBLE_PROFILES);
-		if (p) {
-			gf_isom_set_mpegh_compatible_profiles(ctx->file, tkw->track_num, tkw->stsd_idx, p->value.uint_list.vals, p->value.uint_list.nb_items);
-		}
 	}
 
 	if (ctx->btrt && !tkw->skip_bitrate_update) {
@@ -4623,7 +4626,7 @@ static GF_Err mp4_mux_process_sample(GF_MP4MuxCtx *ctx, TrackWriter *tkw, GF_Fil
 static GF_Err mp4_mux_process_item(GF_MP4MuxCtx *ctx, TrackWriter *tkw, GF_FilterPacket *pck)
 {
 	GF_Err e;
-	u32 meta_type, item_id, size, item_type, nb_items, media_brand;
+	u32 meta_type, item_id, size, item_type, nb_items, media_brand = GF_ISOM_BRAND_HEIF;
 	GF_ImageItemProperties image_props;
 	GF_ImageItemProtection cenc_info;
 	const char *data, *item_name=NULL;
@@ -4793,6 +4796,14 @@ static GF_Err mp4_mux_process_item(GF_MP4MuxCtx *ctx, TrackWriter *tkw, GF_Filte
 		}
 		media_brand = GF_ISOM_BRAND_VVIC;
 		break;
+	case GF_CODECID_RAW:
+		p = gf_filter_pid_get_property(tkw->ipid, GF_PROP_PID_PIXFMT);
+		if (p && (p->value.uint==GF_PIXEL_UNCV)) {
+			image_props.config_ba = dsi->value.data.ptr;
+			image_props.config_ba_size = dsi->value.data.size;
+			item_type = GF_4CC('u','n','c','i');
+			break;
+		}
 	default:
 		GF_LOG(GF_LOG_ERROR, GF_LOG_CONTAINER, ("Error: Codec %s not supported to create HEIF image items\n", gf_codecid_name(tkw->codecid) ));
 		return GF_NOT_SUPPORTED;

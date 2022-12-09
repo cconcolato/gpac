@@ -145,10 +145,12 @@ static void ffdmx_set_decoder_config(GF_FilterPid *pid, const u8 *exdata, u32 ex
 		gf_filter_pid_set_property(pid, GF_PROP_PID_DECODER_CONFIG, &PROP_DATA_NO_COPY( dsi, dsi_size) );
 }
 
+#if (LIBAVCODEC_VERSION_MAJOR>58)
 static inline u32 rescale_mdcv(AVRational q, int b)
 {
     return (u32) av_rescale(q.num, b, q.den);
 }
+#endif
 
 //dovi_meta.h not exported in old releases, just redefine
 typedef struct {
@@ -849,7 +851,7 @@ GF_Err ffdmx_init_common(GF_Filter *filter, GF_FFDemuxCtx *ctx, u32 grab_type)
 			gf_filter_pid_set_property(pid, GF_PROP_PID_UNFRAMED, &PROP_BOOL(GF_TRUE) );
 		}
 #ifdef FFMPEG_NO_DOVI
-		else {
+		else if (!gf_sys_is_test_mode() ){
 			//force reparse of nalu-base codecs if no dovi support 
 			switch (gpac_codec_id) {
 			case GF_CODECID_AVC:
