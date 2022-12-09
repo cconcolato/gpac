@@ -150,6 +150,26 @@ GF_Err av1dmx_configure_pid(GF_Filter *filter, GF_FilterPid *pid, Bool is_remove
 		if (p) ctx->cur_fps = p->value.frac;
 
 		ctx->copy_props = GF_TRUE;
+		
+		p = gf_filter_pid_get_property(ctx->ipid, GF_PROP_PID_UNFRAMED_AV1TS);
+		if (p && p->value.boolean) {
+			GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("[AV1Dmx] Detected AV1 TS format\n"));
+			ctx->bsmode = OBUs;
+			ctx->use_sc_epb = GF_TRUE;
+			gf_av1_reset_state(&ctx->state, GF_FALSE);
+			if (!ctx->state.config)
+				ctx->state.config = gf_odf_av1_cfg_new();
+
+			ctx->is_av1 = GF_TRUE;
+			ctx->codecid = GF_CODECID_AV1;
+			ctx->pts_from_file = GF_FALSE;
+
+			ctx->cur_fps = ctx->fps;
+			if (!ctx->fps.num || !ctx->fps.den) {
+				ctx->cur_fps.num = 25000;
+				ctx->cur_fps.den = 1000;
+			}
+		}
 	}
 	return GF_OK;
 }
@@ -264,12 +284,7 @@ GF_Err av1dmx_check_format(GF_Filter *filter, GF_AV1DmxCtx *ctx, GF_BitStream *b
 	}
 
 
-	p = gf_filter_pid_get_property(ctx->ipid, GF_PROP_PID_UNFRAMED_AV1TS);
-	if (p && p->value.boolean) {
-		GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("[AV1Dmx] Detected AV1 TS format\n"));
-		ctx->bsmode = OBUs;
-		ctx->use_sc_epb = GF_TRUE;
-	} else if (gf_media_aom_probe_annexb(bs)) {
+	if (gf_media_aom_probe_annexb(bs)) {
 		GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("[AV1Dmx] Detected Annex B format\n"));
 		ctx->bsmode = AnnexB;
 	} else {
@@ -953,7 +968,8 @@ static GF_Err av1dmx_parse_flush_sample(GF_Filter *filter, GF_AV1DmxCtx *ctx)
 		GF_LOG(GF_LOG_DEBUG, GF_LOG_MEDIA, ("[AV1Dmx] no frame OBU, skipping OBU\n"));
 		return GF_OK;
 	}
-
+	GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Flushing packet\n"));
+	
 	pck = gf_filter_pck_new_alloc(ctx->opid, pck_size, &output);
 	if (!pck) return GF_OUT_OF_MEM;
 
@@ -1043,15 +1059,22 @@ GF_Err av1dmx_parse_av1(GF_Filter *filter, GF_AV1DmxCtx *ctx)
 		e = GF_NOT_SUPPORTED;
 	}
 
-	//check pid state
-	av1dmx_check_pid(filter, ctx);
-
-	//fixme, we need to flush at each DFG start - for now we assume one PES = one DFG as we do in the muxer
-	if (ctx->timescale && (e==GF_BUFFER_TOO_SMALL))
-		e = GF_OK;
+	if (!ctx->use_sc_epb) {
+		//check pid state
+		av1dmx_check_pid(filter, ctx);
+	}
+	
+	if (ctx->use_sc_epb && e == GF_OK &&
+		ctx->state.frame_state.show_frame == 0 &&
+		ctx->state.frame_state.show_existing_frame == 0) {
+		// Until we have received the last frame of the TU,
+		// i.e. either a show frame or a show existing frame,
+		// we cannot dispatch the packet
+		e = GF_BUFFER_TOO_SMALL;
+		GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Cannot flush sample yet\n"));
+	}
 
 	if (e) return e;
-
 
 	if (!ctx->opid) {
 		if (ctx->state.obu_type != OBU_TEMPORAL_DELIMITER) {
@@ -1080,6 +1103,7 @@ static void copy_data_to_epb_buffer(GF_AV1DmxCtx *ctx, const char *data, u32 dat
 	}
 	memcpy(ctx->epb_buffer+ctx->epb_buf_size, data, data_size);
 	ctx->epb_buf_size += data_size;
+	GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Adding %d bytes to EPB buffer, new size: %d\n", data_size, ctx->epb_buf_size));
 }
 
 static void remove_data_from_epb_buffer(GF_AV1DmxCtx *ctx, u32 position)
@@ -1088,6 +1112,7 @@ static void remove_data_from_epb_buffer(GF_AV1DmxCtx *ctx, u32 position)
 		assert(ctx->epb_buf_size>=position);
 		memmove(ctx->epb_buffer, ctx->epb_buffer+position, sizeof(char) * (ctx->epb_buf_size-position));
 		ctx->epb_buf_size -= position;
+		GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Removing data from EPB buffer from position %d, old size: %d, new size: %d\n", position, ctx->epb_buf_size+position, ctx->epb_buf_size));
 	}
 }
 
@@ -1099,6 +1124,7 @@ static void copy_data_to_buffer(GF_AV1DmxCtx *ctx, const char *data, u32 data_si
 	}
 	memcpy(ctx->buffer+ctx->buf_size, data, data_size);
 	ctx->buf_size += data_size;
+	GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Adding %d bytes to buffer, new size: %d\n", data_size, ctx->buf_size));
 }
 
 static void remove_data_from_buffer(GF_AV1DmxCtx *ctx, u32 position)
@@ -1107,41 +1133,85 @@ static void remove_data_from_buffer(GF_AV1DmxCtx *ctx, u32 position)
 		assert(ctx->buf_size>=position);
 		memmove(ctx->buffer, ctx->buffer+position, sizeof(char) * (ctx->buf_size-position));
 		ctx->buf_size -= position;
+		GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Removing data from buffer from position %d, old size: %d, new size: %d\n", position, ctx->buf_size+position, ctx->buf_size));
 	}
 }
 
 // av1dmx_process_data processes the given data and does not touch the buffer in GF_AV1DmxCtx
-static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *data, u32 data_size, u32 *last_obu_end)
+static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const char *data, u32 data_size, u32 *last_obu_end, Bool is_eos)
 {
+	u8 *clean_data = NULL;
+	const char *saved_data = NULL;
+	u32 saved_data_size = 0;
 	GF_Err e = GF_OK;
+	
+	GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("process data called, size: %d, eos: %d\n", data_size, is_eos));
 	if (!last_obu_end) {
+		GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("Missing parameter last_obu_end\n"));
 		return GF_BAD_PARAM;
 	}
 	*last_obu_end = 0;
 
 	if (ctx->use_sc_epb) {
+		// if the stream uses Start Codes and Emulation Prevention Bytes
+		// we aggregate data, and remove SC and EPB before processing the data as usual
 		const u8 START_CODE_SIZE = 3;
-		// Copy input to the EPB buffer and mark all of it as used
+		u32 sc_size = 0;
+		s32 sc_pos = 0;
+		if (!ctx->epb_buf_size) {
+			// when there is nothing in the EPB buffer, make sure what we append starts with a SC
+			if (data[0] != 0 || data[1] != 0 || data[2] != 1) {
+				GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("Ignore data as it does not start with a start code\n"));
+				return GF_NON_COMPLIANT_BITSTREAM;
+			} else {
+				GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Start code found at beginning of buffer\n"));
+			}
+		}
+		// Copy input to the EPB buffer
 		copy_data_to_epb_buffer(ctx, data, data_size);
+		// mark all input as used
 		*last_obu_end = data_size;
-		
-		// Try to find an entire OBU (by start code)
-		u32 sc_size =0;
-		u32 obu_size = 0;
-		s32 sc_pos = gf_media_nalu_next_start_code(ctx->epb_buffer, ctx->epb_buf_size, &sc_size);
-		if (sc_pos == ctx->epb_buf_size) {
+
+		// Try to find an entire OBU (search for the next start code)
+		sc_pos = gf_media_nalu_next_start_code(ctx->epb_buffer+START_CODE_SIZE, ctx->epb_buf_size, &sc_size);
+		if (sc_pos == ctx->epb_buf_size && !is_eos) {
+			GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Next start code not found\n"));
 			//no start code, continue gathering data
 			return GF_BUFFER_TOO_SMALL;
 		} else {
+			u32 obu_size = sc_pos;
 			// found next start code, process OBU
-			obu_size = sc_pos-START_CODE_SIZE;
-			u32 nb_epb = gf_media_nalu_emulation_bytes_remove_count(data+START_CODE_SIZE, sc_pos-START_CODE_SIZE);
-			u8 *no_epb_data = malloc(obu_size-nb_epb);
-			if (nb_epb) {
-				obu_size = gf_media_nalu_remove_emulation_bytes(data+START_CODE_SIZE, no_epb_data, sc_pos);
-			} else {
-				memcpy(no_epb_data, data+START_CODE_SIZE, sc_pos-START_CODE_SIZE);
+			GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Next start code found at position %d\n", sc_pos));
+			if (sc_size && sc_size != START_CODE_SIZE) {
+				GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("Mismatch in start code size: %d vs %d\n", sc_size, START_CODE_SIZE));
+				return GF_NON_COMPLIANT_BITSTREAM;
 			}
+			if (obu_size == 0) {
+				GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("Error detecting 0-size OBU\n"));
+				return GF_NON_COMPLIANT_BITSTREAM;
+			}
+			u32 nb_epb = gf_media_nalu_emulation_bytes_remove_count(ctx->epb_buffer+START_CODE_SIZE, sc_pos-START_CODE_SIZE);
+			GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Number of EPB found %d\n", nb_epb));
+			if (obu_size <= nb_epb) {
+				GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("Error in OBU size detection with EPB: %d vs %d\n", obu_size, nb_epb));
+				return GF_NON_COMPLIANT_BITSTREAM;
+			}
+			clean_data = gf_malloc(obu_size-nb_epb);
+			if (!clean_data) {
+				GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("Cannot allocate clean OBU buffer of size \n", obu_size-nb_epb));
+				return GF_OUT_OF_MEM;
+			}
+			if (nb_epb) {
+				obu_size = gf_media_nalu_remove_emulation_bytes(ctx->epb_buffer+START_CODE_SIZE, clean_data, sc_pos);
+			} else {
+				memcpy(clean_data, ctx->epb_buffer+START_CODE_SIZE, sc_pos);
+			}
+			GF_LOG(GF_LOG_INFO, GF_LOG_MEDIA, ("Created clean OBU of size %d\n", obu_size));
+			remove_data_from_epb_buffer(ctx, sc_pos+START_CODE_SIZE);
+			saved_data = data;
+			saved_data_size = data_size;
+			data = clean_data;
+			data_size = obu_size;
 		}
 	}
 	
@@ -1155,8 +1225,13 @@ static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const ch
 
 	//check ivf vs obu vs annexB
 	e = av1dmx_check_format(filter, ctx, ctx->bs, last_obu_end);
-	if (e==GF_BUFFER_TOO_SMALL) return GF_OK;
-	else if (e) return e;
+	if (e==GF_BUFFER_TOO_SMALL) {
+		if (clean_data) return GF_BAD_PARAM;
+		else return GF_OK;
+	} else if (e) {
+		if (clean_data) return GF_BAD_PARAM;
+		else return e;
+	}
 
 	while (gf_bs_available(ctx->bs)) {
 
@@ -1178,6 +1253,13 @@ static GF_Err av1dmx_process_data(GF_Filter *filter, GF_AV1DmxCtx *ctx, const ch
 			break;
 	}
 
+	if (clean_data) {
+		gf_free(clean_data);
+		// override regular parsing marker as it does not account for EPB and SC
+		*last_obu_end = saved_data_size;
+		data_size = saved_data_size;
+		data = saved_data;
+	}
 	if (e==GF_EOS) return GF_OK;
 	if (e==GF_BUFFER_TOO_SMALL) return GF_OK;
 	return e;
@@ -1207,7 +1289,7 @@ GF_Err av1dmx_process(GF_Filter *filter)
 			//flush
 			while (ctx->buf_size) {
 				u32 buf_size = ctx->buf_size;
-				e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+				e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length, GF_TRUE);
 				remove_data_from_buffer(ctx, processed_length);
 
 				if (e) break;
@@ -1248,16 +1330,15 @@ GF_Err av1dmx_process(GF_Filter *filter)
 
 			//end of frame, process av1
 			if (end) {
-				e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+				e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length, GF_FALSE);
 				remove_data_from_buffer(ctx, processed_length);
 			}
-			ctx->buf_size=0;
 			gf_filter_pid_drop_packet(ctx->ipid);
 			return e;
 		}
 		//flush of pending frame (might have lost something)
 		if (ctx->buf_size) {
-			e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+			e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length, GF_FALSE);
 			remove_data_from_buffer(ctx, processed_length);
 			ctx->buf_size = 0;
 			if (e) return e;
@@ -1281,7 +1362,7 @@ GF_Err av1dmx_process(GF_Filter *filter)
 		}
 		assert(start && end);
 		//process
-		e = av1dmx_process_data(filter, ctx, data, pck_size, &processed_length);
+		e = av1dmx_process_data(filter, ctx, data, pck_size, &processed_length, GF_FALSE);
 		// no need to remove from buffer as the data has not been added to the buffer
 
 		gf_filter_pid_drop_packet(ctx->ipid);
@@ -1290,7 +1371,7 @@ GF_Err av1dmx_process(GF_Filter *filter)
 
 	//not from framed stream, copy buffer
 	copy_data_to_buffer(ctx, data, pck_size);
-	e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length);
+	e = av1dmx_process_data(filter, ctx, ctx->buffer, ctx->buf_size, &processed_length, GF_FALSE);
 	remove_data_from_buffer(ctx, processed_length);
 	gf_filter_pid_drop_packet(ctx->ipid);
 	return e;
@@ -1412,7 +1493,6 @@ static const GF_FilterCapability AV1DmxCaps[] =
 	CAP_UINT(GF_CAPS_INPUT,GF_PROP_PID_CODECID, GF_CODECID_VP9),
 	CAP_UINT(GF_CAPS_INPUT,GF_PROP_PID_CODECID, GF_CODECID_VP10),
 	CAP_BOOL(GF_CAPS_INPUT,GF_PROP_PID_UNFRAMED, GF_TRUE),
-	CAP_BOOL(GF_CAPS_INPUT,GF_PROP_PID_UNFRAMED_AV1TS, GF_TRUE),
 };
 
 #define OFFS(_n)	#_n, offsetof(GF_AV1DmxCtx, _n)

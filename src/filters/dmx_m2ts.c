@@ -196,6 +196,7 @@ static void m2tsdmx_declare_pid(GF_M2TSDmxCtx *ctx, GF_M2TS_PES *stream, GF_ESD 
 	Bool has_scal_layer = GF_FALSE;
 	Bool unframed = GF_FALSE;
 	Bool unframed_latm = GF_FALSE;
+	Bool unframed_av1 = GF_FALSE;
 	char szName[20];
 	const char *stname;
 	if (stream->user) return;
@@ -276,6 +277,7 @@ static void m2tsdmx_declare_pid(GF_M2TSDmxCtx *ctx, GF_M2TS_PES *stream, GF_ESD 
 			stype = GF_STREAM_VISUAL;
 			codecid = GF_CODECID_AV1;
 			unframed = GF_TRUE;
+			unframed_av1 = GF_TRUE;
 			break;
 		case GF_M2TS_AUDIO_MPEG1:
 			stype = GF_STREAM_AUDIO;
@@ -452,6 +454,7 @@ static void m2tsdmx_declare_pid(GF_M2TSDmxCtx *ctx, GF_M2TS_PES *stream, GF_ESD 
 
 		gf_filter_pid_set_property(opid, GF_PROP_PID_UNFRAMED, unframed ? &PROP_BOOL(GF_TRUE) : NULL);
 		gf_filter_pid_set_property(opid, GF_PROP_PID_UNFRAMED_LATM, unframed_latm ? &PROP_BOOL(GF_TRUE) : NULL );
+		gf_filter_pid_set_property(opid, GF_PROP_PID_UNFRAMED_AV1TS, unframed_av1 ? &PROP_BOOL(GF_TRUE) : NULL );
 
 		if (orig_stype) {
 			gf_filter_pid_set_property(opid, GF_PROP_PID_ORIG_STREAM_TYPE, &PROP_UINT(orig_stype) );

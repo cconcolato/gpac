@@ -3042,7 +3042,6 @@
 					"-lx264",
 					"-lx265",
 					"-lavdevice",
-					"-lpostproc",
 					"-lavfilter",
 					"-ldav1d",
 					"-liconv",
@@ -3091,7 +3090,6 @@
 					"-framework",
 					Metal,
 					"-lovvc",
-					"-lvvdec",
 				);
 				PRODUCT_NAME = gpac;
 				SDKROOT = macosx;
@@ -3172,7 +3170,6 @@
 					"-lx264",
 					"-lx265",
 					"-lavdevice",
-					"-lpostproc",
 					"-lavfilter",
 					"-ldav1d",
 					"-liconv",
@@ -3221,7 +3218,6 @@
 					"-framework",
 					Metal,
 					"-lovvc",
-					"-lvvdec",
 				);
 				PRODUCT_NAME = gpac;
 				SDKROOT = macosx;
