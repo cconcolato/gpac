@@ -58,6 +58,9 @@ typedef struct
 	GF_AV1Config *av1c;
 	u32 av1b_cfg_size;
 	u32 codec_id;
+
+	u64 ts_cts;
+	u64 ts_dts;
 } GF_OBUMxCtx;
 
 GF_Err obumx_configure_pid(GF_Filter *filter, GF_FilterPid *pid, Bool is_remove)
@@ -160,6 +163,13 @@ GF_Err obumx_configure_pid(GF_Filter *filter, GF_FilterPid *pid, Bool is_remove)
 		ctx->fps.num = 25;
 		ctx->fps.den = 1;
 	}
+	if (ctx->mode == FRAMING_AV1TS) {
+		// Since we don't know the actual delay in the stream, we set it to the maximum
+		const u8 BUFFER_POOL_MAX_SIZE = 10;
+		s64 delay = BUFFER_POOL_MAX_SIZE * ctx->fps.den;
+		ctx->ts_cts = (u64)delay;
+		gf_filter_pid_set_property(ctx->opid, GF_PROP_PID_DELAY, &PROP_LONGSINT(delay));
+	}
 	gf_filter_pid_set_property_str(ctx->opid, "obu:mode", &PROP_UINT(ctx->mode) );
 	gf_filter_pid_set_framing_mode(ctx->ipid, GF_TRUE);
 
@@ -168,21 +178,17 @@ GF_Err obumx_configure_pid(GF_Filter *filter, GF_FilterPid *pid, Bool is_remove)
 
 // Create a new packet from the Bitstream
 // Set initial properties from source packet
-// Add packet to the list
-static GF_Err obumx_add_packet(GF_FilterPid *opid,
+static GF_Err obumx_send_packet(GF_FilterPid *opid,
 							   GF_BitStream *bs,
 							   GF_FilterPacket *src_pck,
-							   GF_List *pcks)
+							   Bool first_packet,
+							   u64 cts, u64 dts)
 {
 	u8 *output = NULL;
 	GF_FilterPacket *pck = NULL;
 	u8 *pck_input_data;
 	u32 pck_input_data_size;
 
-	if (!pcks) {
-		GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[OBUWrite] Packet list is null!!\n"));
-		return GF_BAD_PARAM;
-	}
 	gf_bs_get_content(bs, &pck_input_data, &pck_input_data_size);
 	if (!pck_input_data || !pck_input_data_size) {
 		GF_LOG(GF_LOG_ERROR, GF_LOG_MEDIA, ("[OBUWrite] Trying to create an empty packet!!\n"));
@@ -197,7 +203,26 @@ static GF_Err obumx_add_packet(GF_FilterPid *opid,
 	if (src_pck) {
 		gf_filter_pck_merge_properties(src_pck, pck);
 	}
-	gf_list_add(pcks, pck);
+
+	if (cts < dts) {
+		GF_LOG(GF_LOG_WARNING, GF_LOG_MEDIA, ("CTS < DTS: "LLD" < "LLD" !!\n", cts, dts));
+	}
+	gf_filter_pck_set_cts(pck, cts);
+	gf_filter_pck_set_dts(pck, dts);
+
+	if (first_packet) {
+		// The first output packet gets the timing, flags and sap type of the input packet
+		u8 sap_type = gf_filter_pck_get_sap(src_pck);
+		u8 flags = gf_filter_pck_get_dependency_flags(src_pck);
+		gf_filter_pck_set_sap(pck, sap_type);
+		gf_filter_pck_set_dependency_flags(pck, flags);
+	} else {
+		// all other output packets get no flags
+		gf_filter_pck_set_sap(pck, 0);
+		gf_filter_pck_set_dependency_flags(pck, 0);
+	}
+//	fprintf(stderr, "Sending Packet CTS="LLD", DTS="LLD"\n",cts, dts);
+	gf_filter_pck_send(pck);
 	return GF_OK;
 }
 
@@ -233,13 +258,9 @@ static GF_Err format_obu_mpeg2ts(u8* in_data, u32 in_size, u8 **out_data, u32 *o
 // All OBUs are transformed to add start code and emulation prevention bytes
 static GF_Err obumx_process_mpeg2au(GF_OBUMxCtx *ctx, GF_FilterPacket *src_pck, u8 *data, u32 src_pck_size) {
 	Bool first_frame_found = GF_FALSE;
-	u32 pck_count = 0;
 	Bool first_packet = GF_TRUE;
-	GF_List *pcks = gf_list_new();
-	u64 cts = gf_filter_pck_get_cts(src_pck);
-	u32 duration = gf_filter_pck_get_duration(src_pck);
-	u32 out_duration;
-	u64 out_cts;
+	Bool first_tile_group = GF_TRUE;
+	ObuType obu_type;
 
 	if (!ctx->bs_r) ctx->bs_r = gf_bs_new(data, src_pck_size, GF_BITSTREAM_READ);
 	else gf_bs_reassign_buffer(ctx->bs_r, data, src_pck_size);
@@ -251,7 +272,6 @@ static GF_Err obumx_process_mpeg2au(GF_OBUMxCtx *ctx, GF_FilterPacket *src_pck, 
 	ctx->bs_w = gf_bs_new(NULL, 0, GF_BITSTREAM_WRITE);
 
 	while (gf_bs_available(ctx->bs_r)) {
-		ObuType obu_type;
 		u32 obu_size;
 		u32 read_size;
 		u8 *obu_data;
@@ -277,9 +297,13 @@ static GF_Err obumx_process_mpeg2au(GF_OBUMxCtx *ctx, GF_FilterPacket *src_pck, 
 		if (obu_type == OBU_FRAME || obu_type == OBU_FRAME_HEADER) {
 			// start creating packet only after the first frame is found
 			if (first_frame_found) {
-				obumx_add_packet(ctx->opid, ctx->bs_w, src_pck, pcks);
+				obumx_send_packet(ctx->opid, ctx->bs_w, src_pck, first_packet, ctx->ts_cts, ctx->ts_dts);
+				first_packet = GF_FALSE;
 				gf_bs_del(ctx->bs_w);
 				ctx->bs_w = gf_bs_new(NULL, 0, GF_BITSTREAM_WRITE);
+				if (obu_type == OBU_FRAME) {
+					ctx->ts_dts += ctx->fps.den;
+				}
 			}
 			first_frame_found = GF_TRUE;
 		}
@@ -294,42 +318,31 @@ static GF_Err obumx_process_mpeg2au(GF_OBUMxCtx *ctx, GF_FilterPacket *src_pck, 
 		} else {
 			gf_bs_write_data(ctx->bs_w, out_obu_data, out_obu_size);
 		}
+
+		// increase the DTS if the frame needs decoding
+		// we don't have access to the show_existing_frame
+		// so we need to look at the obu_type
+		// including the case frame_header + tile group(s)
+//		if (obu_type == OBU_FRAME || (obu_type == OBU_TILE_GROUP && first_tile_group)) {
+//			ctx->ts_dts += ctx->fps.den;
+//			first_tile_group = GF_FALSE;
+//		} else if (obu_type == OBU_FRAME_HEADER) {
+//			first_tile_group = GF_TRUE;
+//		}
+		fprintf(stderr, "%d "LLD" "LLD"\n", obu_type, ctx->ts_cts, ctx->ts_dts);
 	}
 	// create last packet from any pending data
-	obumx_add_packet(ctx->opid,ctx->bs_w, src_pck, pcks);
+	obumx_send_packet(ctx->opid,ctx->bs_w, src_pck, GF_FALSE, ctx->ts_cts, ctx->ts_dts);
 	gf_bs_del(ctx->bs_w);
 	ctx->bs_w = NULL;
 
-	// Adjust CTS, flags and send
-	pck_count = gf_list_count(pcks);
-	out_duration = duration / pck_count;
-	out_cts = cts;
-	while (gf_list_count(pcks)) {
-		GF_FilterPacket *pck = (GF_FilterPacket *)gf_list_get(pcks, 0);
-		gf_list_rem(pcks, 0);
-		gf_filter_pck_set_cts(pck, out_cts);
-		out_cts += out_duration;
-		if (gf_list_count(pcks) != 0) {
-			gf_filter_pck_set_duration(pck, out_duration);
-		} else {
-			// adjust the duration of the last packet for rounding issues
-			gf_filter_pck_set_duration(pck, duration - (u32)(out_cts-cts));
-		}
-		if (first_packet) {
-			// The first output packet gets the timing, flags and sap type of the input packet
-			u8 sap_type = gf_filter_pck_get_sap(src_pck);
-			u8 flags = gf_filter_pck_get_dependency_flags(src_pck);
-			gf_filter_pck_set_sap(pck, sap_type);
-			gf_filter_pck_set_dependency_flags(pck, flags);
-			first_packet = GF_FALSE;
-		} else {
-			// all other output packets get no flags
-			gf_filter_pck_set_sap(pck, 0);
-			gf_filter_pck_set_dependency_flags(pck, 0);
-		}
-		gf_filter_pck_send(pck);
+	if (obu_type == OBU_FRAME) {
+		ctx->ts_dts += ctx->fps.den;
 	}
-	gf_list_del(pcks);
+
+	// There is only one show_frame or show_existing_frame per TU
+	// so the CTS needs to be incremented only once
+	ctx->ts_cts += ctx->fps.den;
 
 	// we are done with the input packet
 	gf_filter_pid_drop_packet(ctx->ipid);
